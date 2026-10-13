@@ -457,6 +457,17 @@ bool DcTestRunManager::EnableTrace(std::string const& runId)
     return false;
 }
 
+bool DcTestRunManager::RelevelRoster(std::string const& runId, uint32 level)
+{
+    for (std::unique_ptr<DcTestRunJob> const& job : _runs)
+        if (job->RunId() == runId)
+        {
+            job->SetRelevel(level);
+            return true;
+        }
+    return false;
+}
+
 std::string DcTestRunManager::StatusText() const
 {
     if (_runs.empty())

@@ -140,6 +140,10 @@ public:
     // `.dc test start ... trace=1`: arm the Pull Lab trace on a run just
     // started (by its runId). False when no live run has that id.
     bool EnableTrace(std::string const& runId);
+    // `.dc test start ... party=... relevel=N`: re-roll the roster at level N
+    // before the run (DcTestRunJob::SetRelevel). False when no live run has
+    // that id.
+    bool RelevelRoster(std::string const& runId, uint32 level);
 
     std::string StatusText() const;
     bool IsActive() const { return !_runs.empty(); }

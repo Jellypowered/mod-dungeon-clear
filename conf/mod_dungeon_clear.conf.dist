@@ -1638,6 +1638,27 @@ DungeonClear.TestRun.OverallTimeoutS = 7200
 DungeonClear.TestRun.MaxConcurrent = 0
 
 #
+#    DungeonClear.TestRun.WipeRecovery.Enable
+#    DungeonClear.TestRun.WipeRecovery.MaxTotal
+#    DungeonClear.TestRun.WipeRecovery.MaxSameOpponent
+#        When enabled, a party wipe or a death bailout (a member died and
+#        could not be resurrected) does NOT end a `.dc test` run: the harness
+#        revives the party inside the SAME instance at the last safe point
+#        sampled before the fatal pull (each member at its own sampled
+#        position; the entrance when no sample exists), switches DC back on
+#        with its objective latches restored and continues. Every wipe is filed in the record's "wipeRecovery" block
+#        and logged as "TESTRUN WIPE" / "TESTRUN RECOVER". The run gives up
+#        (ending with the original verdict) at the MaxTotal-th wipe, or at the
+#        MaxSameOpponent-th wipe on one opponent. Stuck runs (pause, stall,
+#        no-progress, overall timeout) still end as before.
+#        Default: 0 (off), 12, 4
+#
+
+DungeonClear.TestRun.WipeRecovery.Enable = 0
+DungeonClear.TestRun.WipeRecovery.MaxTotal = 12
+DungeonClear.TestRun.WipeRecovery.MaxSameOpponent = 4
+
+#
 #    DungeonClear.TestRun.MaxPlans
 #        How many `.dc test plan` campaigns may be active at once. Each plan
 #        keeps up to its own `concurrent=` test runs in flight until `total=`
