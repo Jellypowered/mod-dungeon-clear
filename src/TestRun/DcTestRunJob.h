@@ -7,6 +7,8 @@
 #define _PLAYERBOT_DCTESTRUNJOB_H
 
 #include <atomic>
+#include <deque>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -163,6 +165,12 @@ public:
     // reaches Monitoring, and score it with the ten oracles at teardown. Call
     // before Monitoring; a no-op afterwards.
     void EnableTrace() { _traceRequested = true; }
+    // Roster runs only (`relevel=N`). Before the run, re-roll every
+    // member through the playerbots factory at this level (level, spells and
+    // gear for that level; the spec stays with AiPlayerbot.EquipAndSpecPersistence),
+    // so a dungeon can be run at its own level instead of a scaled one. This
+    // CHANGES the characters for good; meant for random-bot rosters. 0 = off.
+    void SetRelevel(uint32 level) { _relevelTo = level; }
     bool IsMonitoring() const { return _stage.load() == Stage::Monitoring; }
     bool IsLab() const { return _lab != nullptr; }
     bool InLabStage() const { return _stage.load() == Stage::Lab; }
@@ -226,6 +234,7 @@ private:
         // The character's guild as of BEFORE the run logged it in, so an
         // unwanted join can be detected and undone. See UndoUnwantedGuild.
         uint32 guildBefore = 0;
+        bool relevelled = false;  // SetRelevel done for this slot
     };
 
     // Boss-roster snapshot taken at Starting so mask deltas can be named
@@ -380,6 +389,7 @@ private:
     void FinishTrace();
     bool _traceRequested = false;
     std::unique_ptr<DcLabRecorder> _trace;
+    uint32 _relevelTo = 0;  // SetRelevel; 0 = off
 
     // --- run identity (set in Create) --------------------------------------
     std::atomic<Stage> _stage{Stage::SpawningBots};
@@ -525,6 +535,63 @@ private:
     DcTestRunRecord::PullEntry _pullEntry;
 
     bool _wasPaused = false;
+
+    // --- wipe recovery (DungeonClear.TestRun.WipeRecovery.*) -----------------
+    // DungeonClear.TestRun.WipeRecovery.Enable: a wipe (FailPartyWiped) or a
+    // death bailout with a corpse (FailDisabled) does not end the run. The
+    // party is revived inside the same instance at the last safe point sampled
+    // before the fatal pull, DC is switched back on with its objective latches
+    // restored, the watchdogs restart, and the wipe is filed in
+    // Record::wipeRecovery. Gives up at the MaxTotal-th wipe or the
+    // MaxSameOpponent-th wipe on one opponent (the run then ends with the
+    // original verdict).
+    // Stuck runs (pause/stall/no-progress/overall) still end as before. The
+    // whole recovery runs inside Stage::Monitoring, so the trace, the
+    // areatrigger relay, `.dc test stop` and the observer gates keep working.
+    struct SafePos
+    {
+        float x = 0.f, y = 0.f, z = 0.f, o = 0.f;
+    };
+    struct SafeSample
+    {
+        uint32 tMs = 0;
+        std::vector<SafePos> pos;  // per _slots index
+    };
+    enum class RecoveryPhase : uint8_t
+    {
+        None,
+        WaitEvade,  // full wipe: let the killers leash home before anyone stands up
+        Arrive,     // revived + teleported: wait until everyone is back in the instance
+        Enable      // `dc on` until it takes, then restore latches and resume
+    };
+    void TrackSafePoint(Player* tank);
+    bool MaybeBeginRecovery(DcTestRun::Verdict verdict, std::string const& failReason);
+    void TickRecovery(uint32 dt, bool abortRequested);
+    void ReviveForRecovery();
+    void ResumeAfterRecovery(Player* tank, AiObjectContext* ctx);
+    void FailRecovery(std::string const& why);
+    bool _recoveryEnabled = false;
+    uint32 _recoveryMaxTotal = 0;
+    uint32 _recoveryMaxSame = 0;
+    std::deque<SafeSample> _safe;
+    RecoveryPhase _recPhase = RecoveryPhase::None;
+    uint32 _recPhaseMs = 0;
+    uint32 _recStartMs = 0;
+    uint32 _recMinWaitMs = 0;
+    uint32 _recEvadeEntry = 0;
+    DcTestRun::Verdict _recVerdict{};
+    std::string _recFailReason;
+    std::vector<SafePos> _recTargets;
+    // SeenDueEvents is deliberately NOT carried over: restored "was due" marks
+    // would read as completions after the teleport.
+    std::unordered_set<uint32> _recSkipped, _recAnchors, _recSeenBosses;
+    uint32 _allAliveMs = 0;  // last monitor tick on which every member was alive
+    void EndRecoveryBookkeeping(std::string const& stop);
+    std::map<std::string, uint32> _wipesByOpponent;
+    std::string _recDisableReason;  // the disable reason the run would have ended with
+    uint32 _recPullSetting = 2;     // pull preference at run start (DcKey::PullSetting)
+    uint32 _lastResumeT = 0;        // seconds since run start (logging only)
+    uint32 _recReviveRetryMs = 0;
 
     // --- observer-written (any thread) --------------------------------------
     mutable std::mutex _obsMutex;

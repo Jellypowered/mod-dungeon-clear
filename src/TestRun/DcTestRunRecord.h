@@ -256,6 +256,45 @@ namespace DcTestRunRecord
         // disbands the party. Serialized under "diag"; absent on records
         // written before schema 3 and on setup failures (no party existed).
         DcDiag::Snapshot diag;
+
+        // Wipe recovery (DungeonClear.TestRun.WipeRecovery.*, off by default).
+        // A wipe or a death bailout no longer ends the run: the harness revives
+        // the party inside the SAME instance at the last safe point before the
+        // fatal pull and re-enables DC, so a run can finish the dungeon after N
+        // attempts. Serialized
+        // under "wipeRecovery" only when the option was on for the run (like
+        // traceFile), so stock records and the schema stay unchanged.
+        // wipeOnBoss/wipeOpponent* above keep their meaning: how the run ENDED.
+        struct WipeEntry
+        {
+            std::uint32_t t = 0;             // seconds since run start, at the verdict
+            std::string cause;               // "wipe" | "bailout" (death bailout with a corpse)
+            std::string reason;              // the fail reason the run would have ended with
+            std::string opponent;            // DeathBlame(): boss or trash name, "" = none
+            std::uint32_t opponentEntry = 0;
+            bool onBoss = false;
+            std::uint32_t bossesKilled = 0;  // progress at the wipe
+            std::uint32_t dead = 0;          // members dead at the verdict
+            std::string lastStanding;
+            std::uint32_t map = 0;
+            float x = 0.f, y = 0.f, z = 0.f; // leader position at the verdict
+            std::int32_t pullIndex = -1;     // index into pulls[] of the pull open at the wipe
+            std::string reviveFrom;          // "safe" (sampled pre-pull point) | "entrance"
+            float reviveX = 0.f, reviveY = 0.f, reviveZ = 0.f;  // leader's revive point
+            std::uint32_t safeAgeS = 0;      // how old the safe sample was at the verdict
+            bool recovered = false;          // run resumed after this wipe
+            std::uint32_t resumedT = 0;      // seconds since run start, at resume
+        };
+        struct WipeRecovery
+        {
+            bool enabled = false;
+            std::uint32_t maxTotal = 0;
+            std::uint32_t maxSameOpponent = 0;
+            std::uint32_t recovered = 0;
+            std::string stop;                // why recovery gave up / failed, "" otherwise
+            std::vector<WipeEntry> wipes;
+        };
+        WipeRecovery wipeRecovery;
     };
 
     // A thrashing run can flip status every publisher tick; keep the head

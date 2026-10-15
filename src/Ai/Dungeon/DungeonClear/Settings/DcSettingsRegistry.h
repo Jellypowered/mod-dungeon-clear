@@ -814,6 +814,12 @@ inline constexpr DcSettingDef kDcSettings[] =
     { "TestRun.StallGraceS",     DcType::UInt,    120,  0,   3600, false },
     { "TestRun.NoProgressS",     DcType::UInt,    600,  0,  86400, false },
     { "TestRun.OverallTimeoutS", DcType::UInt,   7200, 60,  86400, false },
+    // Wipe recovery (off by default): a wipe or a death bailout revives the
+    // party at the last safe point and the run continues; it gives up at the
+    // MaxTotal-th wipe or the MaxSameOpponent-th wipe on one opponent.
+    { "TestRun.WipeRecovery.Enable",          DcType::Bool,  0,  0,    1, false },
+    { "TestRun.WipeRecovery.MaxTotal",        DcType::UInt, 12,  1, 1000, false },
+    { "TestRun.WipeRecovery.MaxSameOpponent", DcType::UInt,  4,  1, 1000, false },
     { "TestRun.Plan.MaxTotal",   DcType::UInt,      0,  0, 100000, false },
     // Pull Lab (src/Lab): how many warm lab parties run scenarios at once. Each
     // is an ordinary test-run party in its own instance, so it also counts

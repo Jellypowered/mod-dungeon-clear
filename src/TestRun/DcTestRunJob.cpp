@@ -9,6 +9,7 @@
 #include <array>
 #include <ctime>
 #include <limits>
+#include <list>
 #include <optional>
 #include <set>
 
@@ -290,6 +291,14 @@ void DcTestRunJob::InitIdentity(Player* gm, DcTestDungeonRegistry::Row const& ro
     _record.stallGraceS = _limits.stallGraceMs / 1000;
     _record.noProgressS = _limits.noProgressMs / 1000;
     _record.overallS = _limits.overallTimeoutMs / 1000;
+
+    // Wipe recovery (see DcTestRunJob.h), off by default.
+    _recoveryEnabled = DcSettings::GetBool(ObjectGuid::Empty, "TestRun.WipeRecovery.Enable");
+    _recoveryMaxTotal = DcSettings::GetUInt(ObjectGuid::Empty, "TestRun.WipeRecovery.MaxTotal");
+    _recoveryMaxSame = DcSettings::GetUInt(ObjectGuid::Empty, "TestRun.WipeRecovery.MaxSameOpponent");
+    _record.wipeRecovery.enabled = _recoveryEnabled;
+    _record.wipeRecovery.maxTotal = _recoveryMaxTotal;
+    _record.wipeRecovery.maxSameOpponent = _recoveryMaxSame;
 }
 
 std::unique_ptr<DcTestRunJob> DcTestRunJob::Create(Player* gm, DcTestDungeonRegistry::Row const& row,
@@ -772,7 +781,10 @@ void DcTestRunJob::Tick(uint32 diff)
     if (!FindGm())
     {
         if (stage == Stage::Monitoring)
+        {
+            EndRecoveryBookkeeping("GM logged out during wipe recovery");  // no-op outside recovery
             Finish(DcTestRun::Verdict::FailAborted, "GM logged out mid-run");
+        }
         else if (stage == Stage::Lab)
         {
             _record.result = "aborted";
@@ -1019,6 +1031,28 @@ void DcTestRunJob::UndoUnwantedGuild(Player* bot, Slot const& slot) const
 
 void DcTestRunJob::TickProvisioningRoster()
 {
+    // relevel=N: one factory re-roll per world tick
+    // (the realm-wide DcProvisionBudget), before the roster is read below.
+    if (_relevelTo)
+        for (Slot& slot : _slots)
+        {
+            if (slot.relevelled)
+                continue;
+            Player* bot = ObjectAccessor::FindPlayer(slot.guid);
+            if (!bot || !bot->IsInWorld() || !GET_PLAYERBOT_AI(bot))
+                return;  // transient — retry next tick; the stage timeout bounds it
+            if (!DcProvisionBudget::Take())
+                return;
+            uint32 const before = bot->GetLevel();
+            PlayerbotFactory factory(bot, _relevelTo);
+            factory.Randomize(false);
+            slot.relevelled = true;
+            LOG_INFO("playerbots.dungeonclear",
+                     "TESTRUN {} relevelled {} from level {} to {} (playerbots factory re-roll, spec {})",
+                     _record.runId, bot->GetName(), before, bot->GetLevel(), AiFactory::GetPlayerSpecName(bot));
+            return;
+        }
+
     for (Slot& slot : _slots)
     {
         if (slot.provisioned)
@@ -1070,6 +1104,8 @@ void DcTestRunJob::TickProvisioningRoster()
 
     // Highest level present is the run's headline level (Create only had the
     // cache's view; this is the live one).
+    if (_relevelTo)
+        _level = 0;  // the cache's pre-relevel level must not win the max below
     for (DcTestRunRecord::CompEntry const& e : _record.comp)
         _level = std::max(_level, e.level);
     _record.level = _level;
@@ -1622,6 +1658,7 @@ void DcTestRunJob::TickStarting()
             _lastMask = inst->GetCompletedEncounterMask();
         _lastAnchors =
             ctx->GetValue<std::unordered_set<uint32>&>(DcKey::ClearedAnchors)->Get().size();
+        _recPullSetting = ctx->GetValue<uint32>(DcKey::PullSetting)->Get();  // wipe recovery
         LOG_INFO("playerbots.dungeonclear",
                  "TESTRUN {} running: instance {} with {} bosses/objectives",
                  _record.runId, _record.instanceId, _record.bossesTotal);
@@ -1839,6 +1876,14 @@ void DcTestRunJob::TrackPulls(Player* tank)
 
     DcPullContext const& pull = ctx->GetValue<DcPullContext&>(DcKey::PullContext)->Get();
 
+    // Wipe recovery: a counter that went BACK is DC's disable resetting
+    // the pull context (death bailout), not a new pull — close, resync, no row.
+    if (_recoveryEnabled && pull.decisionSeq < _pullSeq)
+    {
+        ClosePull();
+        _pullSeq = pull.decisionSeq;
+        return;
+    }
     if (pull.decisionSeq != _pullSeq)
     {
         ClosePull();
@@ -1925,6 +1970,501 @@ bool DcTestRunJob::AnyMemberDead(Player* tank)
     return false;
 }
 
+// --- wipe recovery (DungeonClear.TestRun.WipeRecovery.*) ----------------------
+// See DcTestRunJob.h. Everything here runs on the world thread from
+// TickMonitoring, like the rest of the monitor.
+
+// Sample where the party stands while it is safe: everyone alive, in the run's
+// instance, nobody in combat, nothing engaged. A wipe revives each member at the
+// sample taken a few seconds before the fatal pull was decided, i.e. where the
+// party stood before it went for the pack that killed it.
+void DcTestRunJob::TrackSafePoint(Player* tank)
+{
+    if (!_recoveryEnabled || !tank || !_engaged.Empty() || tank->IsInCombat() || tank->IsFalling())
+        return;
+    uint32 const instanceId = tank->GetInstanceId();
+    SafeSample sample;
+    sample.tMs = _totalMs;
+    sample.pos.reserve(_slots.size());
+    for (Slot const& slot : _slots)
+    {
+        Player* m = ObjectAccessor::FindPlayer(slot.guid);
+        if (!m || !m->IsInWorld() || m->IsBeingTeleported() || !m->IsAlive() || m->IsInCombat() ||
+            m->IsFalling() || m->GetMapId() != _mapId || m->GetInstanceId() != instanceId)
+            return;
+        sample.pos.push_back({m->GetPositionX(), m->GetPositionY(), m->GetPositionZ(), m->GetOrientation()});
+    }
+    if (sample.pos.empty())
+        return;
+    if (!_safe.empty())
+    {
+        SafeSample const& last = _safe.back();
+        float const dx = last.pos.front().x - sample.pos.front().x;
+        float const dy = last.pos.front().y - sample.pos.front().y;
+        float const dz = last.pos.front().z - sample.pos.front().z;
+        if (dx * dx + dy * dy + dz * dz < 16.f && _totalMs - last.tMs < 15000)
+            return;  // the leader moved under 4 yd and the last sample is fresh
+    }
+    _safe.push_back(std::move(sample));
+    if (_safe.size() > 400)
+        _safe.pop_front();
+}
+
+// Called where the monitor would end the run. Returns true when the run is put
+// into recovery instead (the caller then must NOT Finish).
+bool DcTestRunJob::MaybeBeginRecovery(DcTestRun::Verdict verdict, std::string const& failReason)
+{
+    if (!_recoveryEnabled)
+        return false;
+    Player* tank = FindTank();
+    PlayerbotAI* tankAI = tank ? GET_PLAYERBOT_AI(tank) : nullptr;
+    if (!tankAI)
+        return false;
+
+    bool allCleared = false;
+    std::string disableReason;
+    {
+        std::lock_guard<std::mutex> lock(_obsMutex);
+        allCleared = _disableAllCleared;
+        disableReason = _disableReason;
+    }
+    bool const wipe = verdict == DcTestRun::Verdict::FailPartyWiped;
+    bool const bailout = verdict == DcTestRun::Verdict::FailDisabled && !allCleared && AnyMemberDead(tank);
+    if (!wipe && !bailout)
+        return false;
+
+    DcTestRun::Engagement const blame = DeathBlame();
+    DcTestRunRecord::Record::WipeRecovery& wr = _record.wipeRecovery;
+    DcTestRunRecord::Record::WipeEntry w;
+    w.t = _totalMs / 1000;
+    w.cause = wipe ? "wipe" : "bailout";
+    w.reason = failReason;
+    w.opponent = blame.name;
+    w.opponentEntry = blame.entry;
+    w.onBoss = blame.isBoss;
+    w.bossesKilled = _record.bossesKilled;
+    w.lastStanding = _lastAliveMember;
+    w.map = tank->GetMapId();
+    w.x = tank->GetPositionX();
+    w.y = tank->GetPositionY();
+    w.z = tank->GetPositionZ();
+    for (Slot const& slot : _slots)
+    {
+        Player* m = ObjectAccessor::FindConnectedPlayer(slot.guid);
+        if (!m || !m->IsAlive() || m->HasPlayerFlag(PLAYER_FLAGS_GHOST))
+            ++w.dead;
+    }
+    // Revive point. The boundary is the earlier of "the fatal pull was decided"
+    // and "the last tick on which everyone was alive" (deaths DC already
+    // rezzed earlier in the run do not count); the pick is the newest safe
+    // sample at least 5 s older than the last one before that boundary, or
+    // that last one when none is that old. No sample at all -> the entrance.
+    uint32 boundaryMs = std::min<uint32>(_totalMs, _allAliveMs);
+    if (_pullOpen)
+        boundaryMs = std::min<uint32>(boundaryMs, _pullEntry.t * 1000);
+    SafeSample const* pick = nullptr;
+    for (auto it = _safe.rbegin(); it != _safe.rend(); ++it)
+        if (it->tMs <= boundaryMs)
+        {
+            pick = &*it;
+            break;
+        }
+    if (pick)
+    {
+        uint32 const want = pick->tMs > 5000 ? pick->tMs - 5000 : 0;
+        for (auto it = _safe.rbegin(); it != _safe.rend(); ++it)
+            if (it->tMs <= want)
+            {
+                pick = &*it;
+                break;
+            }
+    }
+    uint32 const pickT = pick ? pick->tMs : 0;
+
+    // The fatal pull: the open one, else the last filed pull decided after the
+    // revive sample (a death bailout's disable already closed it).
+    if (_pullOpen && _record.pulls.size() < DcTestRunRecord::kPullLog)
+        w.pullIndex = static_cast<std::int32_t>(_record.pulls.size());
+    else if (!_record.pulls.empty() && pick && _record.pulls.back().t * 1000 >= pickT)
+        w.pullIndex = static_cast<std::int32_t>(_record.pulls.size() - 1);
+
+    _recTargets.assign(_slots.size(), SafePos{_x, _y, _z, _o});
+    if (pick && pick->pos.size() == _slots.size())
+    {
+        _recTargets = pick->pos;
+        w.reviveFrom = "safe";
+        w.safeAgeS = (_totalMs - pickT) / 1000;
+    }
+    else
+        w.reviveFrom = "entrance";
+    if (!_recTargets.empty())
+    {
+        w.reviveX = _recTargets.front().x;
+        w.reviveY = _recTargets.front().y;
+        w.reviveZ = _recTargets.front().z;
+    }
+
+    std::string const key = blame.Empty() ? std::string("(nothing engaged)")
+                            : blame.entry ? std::to_string(blame.entry)
+                                          : blame.name;
+    uint32 const same = ++_wipesByOpponent[key];
+    wr.wipes.push_back(w);
+    uint32 const total = static_cast<uint32>(wr.wipes.size());
+
+    LOG_INFO("playerbots.dungeonclear",
+             "TESTRUN WIPE {} n={}/{} sameOpponent={}/{} cause={} opponent={} entry={} boss={} "
+             "bosses={}/{} dead={} last={} pos={}:{:.1f},{:.1f},{:.1f} revive={}:{:.1f},{:.1f},{:.1f} "
+             "safeAge={}s t={}s reason={}",
+             _record.runId, total, _recoveryMaxTotal, same, _recoveryMaxSame, w.cause,
+             w.opponent.empty() ? "-" : w.opponent, w.opponentEntry, w.onBoss ? 1 : 0,
+             _record.bossesKilled, _record.bossesTotal, w.dead, w.lastStanding.empty() ? "-" : w.lastStanding,
+             w.map, w.x, w.y, w.z, w.reviveFrom, w.reviveX, w.reviveY, w.reviveZ, w.safeAgeS, w.t,
+             failReason);
+
+    if (total >= _recoveryMaxTotal || same >= _recoveryMaxSame)
+    {
+        wr.stop = total >= _recoveryMaxTotal
+                      ? "gave up: " + std::to_string(total) + " wipes (limit " +
+                            std::to_string(_recoveryMaxTotal) + ")"
+                      : "gave up: " + std::to_string(same) + " wipes on " +
+                            (w.opponent.empty() ? key : w.opponent) + " (limit " +
+                            std::to_string(_recoveryMaxSame) + ")";
+        LOG_INFO("playerbots.dungeonclear", "TESTRUN WIPE {} limit hit: {}", _record.runId, wr.stop);
+        return false;  // the caller ends the run with the original verdict
+    }
+
+    // Committed. Forget every sample newer than the revive point: they are the
+    // approach to the pack that just killed the party, and a quick re-wipe must
+    // not revive it at that pack's doorstep.
+    if (pick)
+        while (!_safe.empty() && _safe.back().tMs > pickT)
+            _safe.pop_back();
+
+    ClosePull(false);
+
+    // Snapshot the objective latches `dc on` clears; restored on resume so the
+    // run does not walk back to objectives it already finished.
+    AiObjectContext* ctx = tankAI->GetAiObjectContext();
+    _recSkipped = ctx->GetValue<std::unordered_set<uint32>&>(DcKey::Skipped)->Get();
+    _recAnchors = ctx->GetValue<std::unordered_set<uint32>&>(DcKey::ClearedAnchors)->Get();
+    _recSeenBosses = ctx->GetValue<std::unordered_set<uint32>&>(DcKey::SeenBosses)->Get();
+    _recDisableReason = disableReason;
+
+    // A full wipe leaves DC enabled (no one alive runs the bailout). Switch it
+    // off: nothing may act while the bodies stand up, and the `dc on` below
+    // then starts from a clean run state. The observer latch this sets is
+    // cleared again on resume.
+    if (DcRun::Of(ctx).enabled)
+        DcActionShared::DisableDungeonClear(tankAI, "Test run: party wiped - reviving at the last safe "
+                                                    "point and continuing.");
+
+    _recVerdict = verdict;
+    _recFailReason = failReason;
+    _recPhase = RecoveryPhase::WaitEvade;
+    _recPhaseMs = 0;
+    _recStartMs = _totalMs;
+    _recMinWaitMs = wipe ? 5000 : 0;
+    _recEvadeEntry = blame.entry;
+    _recReviveRetryMs = 0;
+    {
+        std::lock_guard<std::mutex> lock(_obsMutex);
+        _record.statusTimeline.push_back(
+            {_totalMs / 1000, "wipe recovery",
+             "wipe " + std::to_string(total) + " (" + w.cause + ") on " +
+                 (w.opponent.empty() ? std::string("nothing engaged") : w.opponent)});
+    }
+    if (_trace)
+        _trace->AddEvent("wipeRecover", total, w.opponentEntry, static_cast<std::int64_t>(w.bossesKilled),
+                         w.opponent, w.cause);
+    return true;
+}
+
+void DcTestRunJob::ReviveForRecovery()
+{
+    for (std::size_t i = 0; i < _slots.size(); ++i)
+    {
+        Player* m = ObjectAccessor::FindConnectedPlayer(_slots[i].guid);
+        if (!m || !m->IsInWorld())
+        {
+            LOG_WARN("playerbots.dungeonclear", "TESTRUN {} recovery: slot {} is not in world — cannot revive it",
+                     _record.runId, i);
+            continue;
+        }
+        SafePos const p = i < _recTargets.size() ? _recTargets[i] : SafePos{_x, _y, _z, _o};
+
+        // End the lost fight from both sides before moving anyone, and drop the
+        // target: a bot relocated with a stale target walks straight back to the
+        // boss (same sequence as DcRezRecovery::RegroupAtEntrance).
+        m->GetThreatMgr().ClearAllThreat();
+        m->CombatStop(true);
+        m->AttackStop();
+        m->SetTarget();
+        if (PlayerbotAI* ai = GET_PLAYERBOT_AI(m))
+            ai->GetAiObjectContext()->GetValue<Unit*>(DcKey::Stock::CurrentTarget)->Set(nullptr);
+
+        bool const wasDead = !m->IsAlive() || m->HasPlayerFlag(PLAYER_FLAGS_GHOST);
+        if (wasDead)
+        {
+            m->RemoveAurasDueToSpell(27827);  // Spirit of Redemption
+            m->ResurrectPlayer(1.0f, /*applySickness*/ false);
+            m->SpawnCorpseBones();
+        }
+        if (m->IsAlive())
+        {
+            m->SetFullHealth();
+            if (uint32 const maxMana = m->GetMaxPower(POWER_MANA))
+                m->SetPower(POWER_MANA, maxMana);
+        }
+        bool const offMap = m->GetMapId() != _mapId;
+        m->TeleportTo(_mapId, p.x, p.y, p.z, p.o);
+        LOG_INFO("playerbots.dungeonclear", "TESTRUN {} recovery: {} {} -> {:.1f},{:.1f},{:.1f}{}",
+                 _record.runId, m->GetName(), wasDead ? (m->IsAlive() ? "resurrected" : "NOT resurrected")
+                                                      : "regrouped",
+                 p.x, p.y, p.z, offMap ? " (was off the instance map)" : "");
+    }
+}
+
+// Leave recovery for good (failed, aborted, GM gone): the record must read as
+// the run would have without recovery — the original disable reason, and the
+// post-mortem of the wipe that started this recovery even if the party is
+// standing again by now (Finish only fills it while somebody is dead).
+void DcTestRunJob::EndRecoveryBookkeeping(std::string const& stop)
+{
+    if (_recPhase == RecoveryPhase::None)
+        return;
+    _recPhase = RecoveryPhase::None;
+    DcTestRunRecord::Record::WipeRecovery& wr = _record.wipeRecovery;
+    wr.stop = stop;
+    if (!wr.wipes.empty())
+    {
+        _record.wipeOnBoss = wr.wipes.back().onBoss;
+        _record.wipeOpponentEntry = wr.wipes.back().opponentEntry;
+        _record.wipeOpponent = wr.wipes.back().opponent;
+        std::int32_t const pi = wr.wipes.back().pullIndex;
+        if (pi >= 0 && static_cast<std::size_t>(pi) < _record.pulls.size())
+            _record.pulls[pi].wipedHere = true;
+    }
+    std::lock_guard<std::mutex> lock(_obsMutex);
+    _disableReason = _recDisableReason;
+}
+
+void DcTestRunJob::FailRecovery(std::string const& why)
+{
+    LOG_INFO("playerbots.dungeonclear", "TESTRUN WIPE {} recovery failed: {}", _record.runId, why);
+    EndRecoveryBookkeeping("recovery failed: " + why);
+    Finish(_recVerdict, _recFailReason);
+}
+
+void DcTestRunJob::TickRecovery(uint32 dt, bool abortRequested)
+{
+    _recPhaseMs += dt;
+    if (abortRequested)
+    {
+        std::string reason;
+        {
+            std::lock_guard<std::mutex> lock(_obsMutex);
+            reason = _abortReason.empty() ? "aborted" : _abortReason;
+        }
+        EndRecoveryBookkeeping("aborted during wipe recovery");
+        Finish(DcTestRun::Verdict::FailAborted, reason);
+        return;
+    }
+    if (_realChars)
+        for (Slot const& slot : _slots)
+            if (slot.guid && !ObjectAccessor::FindConnectedPlayer(slot.guid))
+            {
+                FailRecovery("roster member " + slot.rosterName + " left the run");
+                return;
+            }
+    if (_limits.overallTimeoutMs && _monitorMs >= _limits.overallTimeoutMs)
+    {
+        FailRecovery("overall time limit reached during recovery");
+        return;
+    }
+    ReassertMaster();
+
+    // Connected lookup: the leader is on a loading screen for a moment after the
+    // recovery teleport, which must not read as "gone".
+    Player* tank = ObjectAccessor::FindConnectedPlayer(_tankGuid);
+    if (!tank)
+    {
+        FailRecovery("leader tank vanished");
+        return;
+    }
+
+    switch (_recPhase)
+    {
+        case RecoveryPhase::WaitEvade:
+        {
+            if (_recPhaseMs < _recMinWaitMs)
+                return;
+            // Let the encounter reset and the killers leash home before anyone
+            // stands up (capped: a script that never clears its in-progress
+            // flag must not hold the run forever).
+            if (_recPhaseMs < 60000)
+            {
+                if (!tank->IsInWorld())
+                    return;
+                if (InstanceScript* inst = DcTargeting::GetInstanceScript(tank))
+                    if (inst->IsEncounterInProgress())
+                        return;
+                if (_recEvadeEntry)
+                {
+                    std::list<Creature*> killers;
+                    tank->GetCreatureListWithEntryInGrid(killers, _recEvadeEntry, 150.f);
+                    for (Creature* c : killers)
+                        if (c->IsAlive() && c->IsInCombat())
+                            return;
+                }
+            }
+            ReviveForRecovery();
+            _recPhase = RecoveryPhase::Arrive;
+            _recPhaseMs = 0;
+            return;
+        }
+        case RecoveryPhase::Arrive:
+        {
+            bool retry = false;
+            for (Slot const& slot : _slots)
+            {
+                Player* m = ObjectAccessor::FindConnectedPlayer(slot.guid);
+                if (!m || !m->IsInWorld() || m->IsBeingTeleported() || !m->IsAlive() ||
+                    m->GetMapId() != _mapId || m->GetInstanceId() != _record.instanceId)
+                {
+                    if (_recPhaseMs >= 30000)
+                    {
+                        FailRecovery("party did not come back up in the instance (" +
+                                     (m ? std::string(m->GetName()) : slot.rosterName) + ")");
+                        return;
+                    }
+                    // In world but still down (or never moved): run the revive again.
+                    if (m && m->IsInWorld() && !m->IsBeingTeleported())
+                        retry = true;
+                    else
+                        return;
+                }
+            }
+            if (retry)
+            {
+                if (_recPhaseMs - _recReviveRetryMs >= 5000)
+                {
+                    _recReviveRetryMs = _recPhaseMs;
+                    ReviveForRecovery();
+                }
+                return;
+            }
+            _recPhase = RecoveryPhase::Enable;
+            _recPhaseMs = 0;
+            return;
+        }
+        case RecoveryPhase::Enable:
+        {
+            PlayerbotAI* tankAI = GET_PLAYERBOT_AI(tank);
+            if (!tankAI || !tank->IsInWorld())
+            {
+                if (_recPhaseMs >= 20000)
+                    FailRecovery("leader not ready for dc on");
+                return;
+            }
+            for (Slot const& slot : _slots)
+                if (Player* bot = ObjectAccessor::FindPlayer(slot.guid))
+                    DcStrategyGate::Reconcile(bot);
+            AiObjectContext* ctx = tankAI->GetAiObjectContext();
+            if (!_runWing.empty())
+                if (DungeonWingLayout const* layout = DungeonWingRegistry::Get(_mapId))
+                    if (DungeonWing const* wing = DungeonWingRegistry::FindWing(*layout, _runWing))
+                        DcRunWing::Set(tank, *wing, DcRunWing::Source::Explicit);
+            if (!DcRun::Of(ctx).enabled)
+            {
+                // The disable reverted the pull preference to Dynamic; give the
+                // run back the one it started with.
+                ctx->GetValue<uint32>(DcKey::PullSetting)->Set(_recPullSetting);
+                tankAI->DoSpecificAction("dc on", Event("dc", "", FindGm()), true);
+            }
+            if (DcRun::Of(ctx).enabled)
+            {
+                ResumeAfterRecovery(tank, ctx);
+                return;
+            }
+            if (_recPhaseMs >= 20000)
+                FailRecovery("dc on did not take after the revive (look for 'DC command refused')");
+            return;
+        }
+        default:
+            return;
+    }
+}
+
+void DcTestRunJob::ResumeAfterRecovery(Player* tank, AiObjectContext* ctx)
+{
+    auto restore = [ctx](char const* key, std::unordered_set<uint32> const& snap)
+    {
+        std::unordered_set<uint32>& live = ctx->GetValue<std::unordered_set<uint32>&>(key)->Get();
+        live.insert(snap.begin(), snap.end());
+    };
+    restore(DcKey::Skipped, _recSkipped);
+    restore(DcKey::ClearedAnchors, _recAnchors);
+    restore(DcKey::SeenBosses, _recSeenBosses);
+    if (_isScenario)
+        ApplyScenarioSkips(tank, ctx);
+
+    // `dc on` restarted the pull counter; resync so the next tick does not file
+    // a phantom pull. _lastMask is kept on purpose: a boss that died in the same
+    // moment as the party is still filed by the next monitor tick.
+    _pullSeq = ctx->GetValue<DcPullContext&>(DcKey::PullContext)->Get().decisionSeq;
+    _pullOpen = false;
+
+    // Fresh watchdogs for the new attempt.
+    _wipedForMs = 0;
+    _lastAliveMember.clear();
+    _pausedForMs = 0;
+    _wasPaused = false;
+    _stalledForMs = 0;
+    _progressClock.sinceMs = 0;
+    _sinceProgressMs = 0;
+    _frozenDumpLogged = false;
+    _bestDist = -1.f;
+    _bestDistEntry = 0;
+    _lastInCombat = false;
+    _lastVictim = ObjectGuid::Empty;
+    _lastVictimHpPct = 0;
+    _engaged = DcTestRun::Engagement{};
+    _lastDeathEngaged = DcTestRun::Engagement{};
+    for (Slot const& slot : _slots)
+        _aliveLast[slot.guid] = true;
+    _allAliveMs = _totalMs;
+
+    DcTestRunRecord::Record::WipeRecovery& wr = _record.wipeRecovery;
+    uint32 const n = static_cast<uint32>(wr.wipes.size());
+    if (!wr.wipes.empty())
+    {
+        wr.wipes.back().recovered = true;
+        wr.wipes.back().resumedT = _totalMs / 1000;
+    }
+    ++wr.recovered;
+    _lastResumeT = _totalMs / 1000;
+    uint32 const tookS = (_totalMs - _recStartMs) / 1000;
+    {
+        std::lock_guard<std::mutex> lock(_obsMutex);
+        _disableFired = false;
+        _disableAllCleared = false;
+        _disableReason.clear();
+        _record.statusTimeline.push_back(
+            {_totalMs / 1000, "wipe recovery", "resumed after wipe " + std::to_string(n)});
+    }
+    _recPhase = RecoveryPhase::None;
+    _recSkipped.clear();
+    _recAnchors.clear();
+    _recSeenBosses.clear();
+
+    LOG_INFO("playerbots.dungeonclear",
+             "TESTRUN RECOVER {} n={} resumed after {}s at {:.1f},{:.1f},{:.1f} bosses={}/{}",
+             _record.runId, n, tookS, tank->GetPositionX(), tank->GetPositionY(), tank->GetPositionZ(),
+             _record.bossesKilled, _record.bossesTotal);
+    if (_trace)
+        _trace->AddEvent("wipeResume", n, 0, static_cast<std::int64_t>(tookS));
+}
+
 void DcTestRunJob::TickMonitoring(uint32 dt)
 {
     DcTestRun::Observation obs;
@@ -1936,6 +2476,14 @@ void DcTestRunJob::TickMonitoring(uint32 dt)
         obs.abortRequested = _abortRequested;
         obs.disableFired = _disableFired;
         obs.disableAllCleared = _disableAllCleared;
+    }
+
+    // A wipe recovery in flight owns the monitor tick until the
+    // run resumes (or gives up and finishes).
+    if (_recPhase != RecoveryPhase::None)
+    {
+        TickRecovery(dt, obs.abortRequested);
+        return;
     }
 
     // Connected-lookup + explicit teleport tolerance: DC's own scripted
@@ -2120,6 +2668,9 @@ void DcTestRunJob::TickMonitoring(uint32 dt)
         TrackDeaths(tank);
         TrackEngagement(tank);
         TrackPulls(tank);
+        TrackSafePoint(tank);  // wipe recovery
+        if (!AnyMemberDead(tank))
+            _allAliveMs = _totalMs;  // wipe recovery: start of the current death streak
 
         if (next.has_value() && next->mapId == tank->GetMapId())
         {
@@ -2320,6 +2871,9 @@ void DcTestRunJob::TickMonitoring(uint32 dt)
             break;
     }
 
+    // Wipe recovery: a wipe / death bailout revives the party in place instead.
+    if (MaybeBeginRecovery(verdict, failReason))
+        return;
     Finish(verdict, failReason);
 }
 

@@ -584,6 +584,12 @@ def render_header(rec, live_rec, plan, plan_live, start_s, end_s):
             lines.append(f"  wipe     : {rec.get('wipeOpponent') or '?'} "
                          f"(entry {rec.get('wipeOpponentEntry', 0)}) "
                          f"onBoss={bool(rec.get('wipeOnBoss'))}")
+        # wipe recovery block (DungeonClear.TestRun.WipeRecovery.*)
+        wr = rec.get("wipeRecovery")
+        if wr:
+            lines.append(f"  recovery : {len(wr.get('wipes') or [])} wipe(s), {wr.get('recovered', 0)} recovered"
+                         f" (limits {wr.get('maxTotal')} total / {wr.get('maxSameOpponent')} same opponent)"
+                         + (f" — {wr['stop']}" if wr.get("stop") else ""))
     else:
         lines.append(f"  result   : {bold('IN FLIGHT')} — no record yet, live state only")
         lines.append(f"  stage    : {live_rec.get('stage','?')} / {live_rec.get('state','?')}")
@@ -695,6 +701,24 @@ def render_deaths(rec):
              d.get("opponentEntry", ""), "ON BOSS" if d.get("onBoss") else ""]
             for d in deaths]
     return table(rows, ["at", "who", "killed by", "entry", ""])
+
+
+def render_wipes(rec):
+    """One row per wipe the harness recovered from (or gave up on)."""
+    wr = rec.get("wipeRecovery") or {}
+    wipes = wr.get("wipes") or []
+    if not wipes:
+        return ["  (none)" if wr else "  (wipe recovery was off for this run)"]
+    rows = []
+    for w in wipes:
+        pos = w.get("pos") or {}
+        rev = w.get("revive") or {}
+        rows.append([mmss(w.get("t")), w.get("cause", "?"), w.get("opponent") or "-",
+                     "BOSS" if w.get("onBoss") else "", w.get("bossesKilled", ""), w.get("dead", ""),
+                     f"{pos.get('x', 0):.0f},{pos.get('y', 0):.0f},{pos.get('z', 0):.0f}",
+                     f"{w.get('reviveFrom', '?')} {rev.get('x', 0):.0f},{rev.get('y', 0):.0f},{rev.get('z', 0):.0f}",
+                     mmss(w.get("resumedT")) if w.get("recovered") else "no"])
+    return table(rows, ["at", "cause", "opponent", "", "bosses", "dead", "where", "revived at", "resumed"])
 
 
 def render_pulls(rec):
@@ -1570,6 +1594,8 @@ def main():
     if extras:
         print(hr("EVENT EXTRAS"));  print("\n".join(extras))
     print(hr("DEATHS"));           print("\n".join(render_deaths(rec)))
+    if rec.get("wipeRecovery") is not None:
+        print(hr("WIPES (recovered)")); print("\n".join(render_wipes(rec)))
     print(hr("PULLS"));            print("\n".join(render_pulls(rec)))
     print(hr("STATUS TIMELINE"));  print("\n".join(render_status_timeline(rec, live_rec, args.timeline)))
     print(hr("PAUSES"));           print("\n".join(render_pauses(rec)))

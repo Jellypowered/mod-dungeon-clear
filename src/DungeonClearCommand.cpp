@@ -419,6 +419,9 @@ public:
     // party of REAL player characters instead (roles positional). level=, seed=
     // and the gear options are all meaningless there: the level comes from the
     // characters, the roster is the comp, and real characters are never re-geared.
+    // The exception is an explicit `relevel=N`: it re-rolls every roster member at
+    // level N through the playerbots factory before the run (a lasting change,
+    // meant for random-bot rosters).
     static bool HandleTestStart(ChatHandler* handler, Tail args)
     {
         if (DcDisabledNotice(handler))
@@ -431,7 +434,7 @@ public:
         static constexpr char const* kUsage =
             "Usage: .dc test start <dungeon> [heroic] [size=N|10|25] [level=N] [seed=N] "
             "[ilvl=N|none] [quality=normal|uncommon|rare|epic|legendary] [trace=1]\n"
-            "   or: .dc test start <dungeon> party=Tank,Heal,Dps1,Dps2,... [heroic] [trace=1]";
+            "   or: .dc test start <dungeon> party=Tank,Heal,Dps1,Dps2,... [heroic] [trace=1] [relevel=N]";
 
         std::string token;
         std::string party;
@@ -441,6 +444,7 @@ public:
         DcTestGearTiers::Spec gear;
         bool heroic = false;
         bool trace = false;  // Pull Lab trace + oracles (lab_traces/<runId>.jsonl)
+        uint32 relevel = 0;  // party= runs only: re-roll the roster at this level first
         std::istringstream in{std::string(args)};
         std::string word;
         while (in >> word)
@@ -477,6 +481,8 @@ public:
                 heroic = true;
             else if (word.rfind("trace=", 0) == 0)
                 trace = word.substr(6) == "1" || word.substr(6) == "on";
+            else if (word.rfind("relevel=", 0) == 0)
+                relevel = static_cast<uint32>(std::strtoul(word.c_str() + 8, nullptr, 10));
             else if (token.empty())
                 token = word;
             // Raid-size presets: a bare 10/25 AFTER the dungeon token reads as
@@ -512,9 +518,19 @@ public:
                 return true;
             }
             DcTestRunManager::Instance().StartRoster(issuer, token, party, heroic, &msg, "", nullptr, &runId);
+            // relevel=N is the one deliberate exception to "never change the
+            // characters": it re-rolls the roster at level N before the run
+            // (meant for random-bot rosters). See DcTestRunJob::SetRelevel.
+            if (relevel && !runId.empty() && DcTestRunManager::Instance().RelevelRoster(runId, relevel))
+                msg += " [roster re-rolled at level " + std::to_string(relevel) + " before the run]";
         }
         else
         {
+            if (relevel)
+            {
+                handler->SendSysMessage("relevel= only applies to party= runs (pool runs use level=).");
+                return true;
+            }
             if (size && (size < 2 || size > 40))
             {
                 handler->SendSysMessage("size must be 2-40 (presets 10/25).");

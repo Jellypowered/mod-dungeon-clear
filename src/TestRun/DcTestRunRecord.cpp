@@ -260,6 +260,41 @@ namespace DcTestRunRecord
             s << ",\"oracles\":";
             AppendEscaped(s, rec.oracles);
         }
+        // Wipe recovery block, only on runs that had it on.
+        if (rec.wipeRecovery.enabled)
+        {
+            Record::WipeRecovery const& wr = rec.wipeRecovery;
+            s << ",\"wipeRecovery\":{\"maxTotal\":" << wr.maxTotal
+              << ",\"maxSameOpponent\":" << wr.maxSameOpponent
+              << ",\"recovered\":" << wr.recovered << ",\"stop\":";
+            AppendEscaped(s, wr.stop);
+            s << ",\"wipes\":[";
+            for (std::size_t i = 0; i < wr.wipes.size(); ++i)
+            {
+                Record::WipeEntry const& w = wr.wipes[i];
+                if (i)
+                    s << ',';
+                s << "{\"t\":" << w.t << ",\"cause\":";
+                AppendEscaped(s, w.cause);
+                s << ",\"reason\":";
+                AppendEscaped(s, w.reason);
+                s << ",\"opponent\":";
+                AppendEscaped(s, w.opponent);
+                s << ",\"opponentEntry\":" << w.opponentEntry
+                  << ",\"onBoss\":" << (w.onBoss ? "true" : "false")
+                  << ",\"bossesKilled\":" << w.bossesKilled << ",\"dead\":" << w.dead
+                  << ",\"lastStanding\":";
+                AppendEscaped(s, w.lastStanding);
+                s << ",\"pos\":{\"map\":" << w.map << ",\"x\":" << w.x << ",\"y\":" << w.y
+                  << ",\"z\":" << w.z << "},\"pullIndex\":" << w.pullIndex << ",\"reviveFrom\":";
+                AppendEscaped(s, w.reviveFrom);
+                s << ",\"revive\":{\"x\":" << w.reviveX << ",\"y\":" << w.reviveY << ",\"z\":" << w.reviveZ
+                  << "},\"safeAgeS\":" << w.safeAgeS
+                  << ",\"recovered\":" << (w.recovered ? "true" : "false")
+                  << ",\"resumedT\":" << w.resumedT << '}';
+            }
+            s << "]}";
+        }
         s << ",\"wipeOnBoss\":" << (rec.wipeOnBoss ? "true" : "false")
           << ",\"wipeOpponentEntry\":" << rec.wipeOpponentEntry
           << ",\"wipeOpponent\":";
